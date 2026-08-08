@@ -2268,6 +2268,8 @@ internal class MediaServiceHandlerImpl(
                     loadJob?.join()
                     resetCrossfade()
                     player.seekTo(index, savedPosition)
+                    // AA may have connected before restore finished — start if still pending.
+                    player.onQueueRestoredAfterColdStart()
                 }
             }
         }

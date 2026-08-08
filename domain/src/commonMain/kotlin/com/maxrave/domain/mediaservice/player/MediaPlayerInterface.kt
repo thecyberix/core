@@ -103,6 +103,12 @@ interface MediaPlayerInterface {
 
     fun removeListener(listener: MediaPlayerListener)
 
+    /**
+     * Invoked after cold-start queue restore finishes. Default no-op; Android Auto
+     * adapters may start playback if a car connect was waiting for the queue.
+     */
+    fun onQueueRestoredAfterColdStart() {}
+
     // Release resources
     fun release()
 }

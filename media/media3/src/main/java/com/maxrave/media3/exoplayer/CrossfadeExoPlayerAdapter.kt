@@ -210,19 +210,28 @@ internal class CrossfadeExoPlayerAdapter(
     private var carResumeJob: Job? = null
 
     /**
+     * AA connected before [mayBeRestoreQueue] finished loading tracks — play once the queue appears.
+     */
+    @Volatile
+    private var pendingAaIdlePlay = false
+
+    /**
      * When AA projection returns after MODE (USB/radio), resume only if we were interrupted
      * while playing — not if the user paused or another music app took over.
      */
     private val carConnectionObserver =
         Observer<Int> { connectionType ->
-            Logger.d(TAG, "CarConnection type=$connectionType resumePending=$resumeOnFocusGain")
-            if (connectionType != CarConnection.CONNECTION_TYPE_PROJECTION) return@Observer
+            Logger.w(TAG, "CarConnection type=$connectionType resumePending=$resumeOnFocusGain")
+            if (connectionType != CarConnection.CONNECTION_TYPE_PROJECTION) {
+                pendingAaIdlePlay = false
+                return@Observer
+            }
             carResumeJob?.cancel()
             carResumeJob =
                 coroutineScope.launch {
                     // Let the wireless AA audio route settle after MODE.
                     delay(600)
-                    resumeIfInterrupted()
+                    onAndroidAutoConnected()
                 }
         }
 
@@ -649,6 +658,19 @@ internal class CrossfadeExoPlayerAdapter(
                     cachedIsLoading = false
                 }
 
+                InternalState.IDLE -> {
+                    if (playlist.isEmpty() || localCurrentMediaItemIndex < 0) {
+                        Logger.w(TAG, "Play: IDLE with empty playlist")
+                        return@launch
+                    }
+                    Logger.w(TAG, "Play: IDLE → loadAndPlay index=$localCurrentMediaItemIndex")
+                    loadAndPlayTrackInternal(
+                        localCurrentMediaItemIndex,
+                        cachedPosition.coerceAtLeast(0L),
+                        shouldPlay = true,
+                    )
+                }
+
                 else -> {
                     Logger.w(TAG, "Play: Called in invalid state: $internalState")
                 }
@@ -677,6 +699,45 @@ internal class CrossfadeExoPlayerAdapter(
         Logger.w(TAG, "resumeIfInterrupted: resuming after car/source interruption")
         resumeOnFocusGain = false
         play()
+    }
+
+    /**
+     * On Android Auto connect: resume an interrupted session, otherwise start the
+     * restored/idle queue if one is loaded and the user did not pause on purpose.
+     */
+    fun onAndroidAutoConnected() {
+        Logger.w(
+            TAG,
+            "onAndroidAutoConnected: playing=$isPlaying pause=$intentionalPause " +
+                "items=$mediaItemCount state=$internalState pending=$pendingAaIdlePlay",
+        )
+        resumeIfInterrupted()
+        if (isPlaying) {
+            pendingAaIdlePlay = false
+            return
+        }
+        if (intentionalPause) {
+            pendingAaIdlePlay = false
+            Logger.w(TAG, "onAndroidAutoConnected: skipped — intentional pause")
+            return
+        }
+        if (mediaItemCount <= 0) {
+            pendingAaIdlePlay = true
+            Logger.w(TAG, "onAndroidAutoConnected: no media yet — will play after restore")
+            return
+        }
+        // Do not gate on isMusicActive: AA/car residual audio often reports active and
+        // would block cold-start play of the saved queue.
+        pendingAaIdlePlay = false
+        Logger.w(TAG, "onAndroidAutoConnected: playing restored/idle queue ($mediaItemCount items)")
+        play()
+    }
+
+    /** Call after [mayBeRestoreQueue] finishes so a pending AA connect can start playback. */
+    override fun onQueueRestoredAfterColdStart() {
+        if (!pendingAaIdlePlay) return
+        Logger.w(TAG, "onQueueRestoredAfterColdStart: fulfilling pending AA play")
+        onAndroidAutoConnected()
     }
 
     private fun otherAppPlayingMedia(): Boolean {

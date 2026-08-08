@@ -138,16 +138,24 @@ internal class SimpleMediaSessionCallback(
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.PREVIOUS, Bundle()))
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.GET_PLATFORM_TOKEN, Bundle()))
                 .build()
-        // Backup for MODE: when Gearhead rebinds after AA returns, resume only if we were
-        // interrupted while playing (adapter also watches CarConnection).
+        // When Gearhead binds: resume interrupted playback, or start the restored queue if idle.
         if (customizeForCar && !session.isMediaNotificationController(controller)) {
             scope.launch {
                 delay(500)
                 runCatching {
-                    (mediaPlayerHandler.player as? com.maxrave.media3.exoplayer.CrossfadeExoPlayerAdapter)
-                        ?.resumeIfInterrupted()
+                    val adapter =
+                        mediaPlayerHandler.player as? com.maxrave.media3.exoplayer.CrossfadeExoPlayerAdapter
+                            ?: return@runCatching
+                    // mayBeRestoreQueue is async — wait for tracks (restore also notifies pending).
+                    if (!adapter.isPlaying && adapter.mediaItemCount == 0) {
+                        repeat(20) {
+                            delay(500)
+                            if (adapter.mediaItemCount > 0) return@repeat
+                        }
+                    }
+                    adapter.onAndroidAutoConnected()
                 }.onFailure {
-                    Logger.e(TAG, "AA resume failed: ${it.message}")
+                    Logger.e(TAG, "AA connect playback failed: ${it.message}")
                 }
             }
         }
