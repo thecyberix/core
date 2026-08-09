@@ -224,6 +224,13 @@ internal class CrossfadeExoPlayerAdapter(
             Logger.w(TAG, "CarConnection type=$connectionType resumePending=$resumeOnFocusGain")
             if (connectionType != CarConnection.CONNECTION_TYPE_PROJECTION) {
                 pendingAaIdlePlay = false
+                // Leaving AA must not auto-play on the phone when focus returns.
+                // Keep resumeOnFocusGain only for temporary losses while still projected (MODE).
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false
+                    Logger.w(TAG, "CarConnection left projection — cleared resumeOnFocusGain")
+                }
+                carResumeJob?.cancel()
                 return@Observer
             }
             carResumeJob?.cancel()
