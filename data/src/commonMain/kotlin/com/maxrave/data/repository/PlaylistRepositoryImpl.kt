@@ -25,6 +25,7 @@ import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.repository.PlaylistRepository
 import com.maxrave.domain.utils.Resource
 import com.maxrave.domain.utils.isRadioMix
+import com.maxrave.domain.utils.isRadioPlaylistId
 import com.maxrave.domain.utils.toTrack
 import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.kotlinytmusicscraper.models.MusicShelfRenderer
@@ -379,9 +380,20 @@ internal class PlaylistRepositoryImpl(
                         var count = 0
                         Logger.d("getPlaylistData", "playlist data: ${listContent.size}")
                         Logger.d("getPlaylistData", "continueParam: $continueParam")
-//                        else {
-//                            var listTrack = playlistBrowse.tracks.toMutableList()
-                        while (continueParam != null) {
+                        // Personalised mixes (Supermix / Replay / Discover) keep returning
+                        // continuations forever — never block the UI waiting for "all" tracks.
+                        // Cap normal playlists too so a bad continuation can't hang forever.
+                        val maxContinuationPages =
+                            when {
+                                playlistId.isRadioPlaylistId() -> 0
+                                else -> 25
+                            }
+                        val maxContinuationTracks = 500
+                        while (
+                            continueParam != null &&
+                            count < maxContinuationPages &&
+                            listContent.size < maxContinuationTracks
+                        ) {
                             youTube
                                 .customQuery(
                                     browseId = null,
@@ -414,6 +426,13 @@ internal class PlaylistRepositoryImpl(
                                     continueParam = null
                                     count++
                                 }
+                        }
+                        if (continueParam != null) {
+                            Logger.w(
+                                "getPlaylistData",
+                                "Stopped early after $count pages / ${listContent.size} extra tracks " +
+                                    "(radio=${playlistId.isRadioPlaylistId()})",
+                            )
                         }
                         Logger.d("getPlaylistData", "playlist final data: ${listContent.size}")
                         parsePlaylistData(header, data ?: emptyList(), playlistId, viewString)?.let { playlist ->
