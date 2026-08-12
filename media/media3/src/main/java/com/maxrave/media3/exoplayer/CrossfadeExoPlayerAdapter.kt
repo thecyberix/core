@@ -57,6 +57,9 @@ import kotlin.math.sin
 
 private const val TAG = "CrossfadeExoPlayerAdapter"
 
+/** Delay after AA projection / Gearhead bind before we may start idle playback. */
+private const val AA_CONNECT_SETTLE_MS = 2_000L
+
 /**
  * ExoPlayer implementation of [MediaPlayerInterface] with crossfade support.
  *
@@ -207,7 +210,7 @@ internal class CrossfadeExoPlayerAdapter(
 
     private var carConnection: CarConnection? = null
 
-    private var carResumeJob: Job? = null
+    private var aaConnectPlayJob: Job? = null
 
     /**
      * AA connected before [mayBeRestoreQueue] finished loading tracks — play once the queue appears.
@@ -216,30 +219,34 @@ internal class CrossfadeExoPlayerAdapter(
     private var pendingAaIdlePlay = false
 
     /**
+     * One auto-play / resume attempt per projection session (CarConnection + onConnect both fire).
+     */
+    @Volatile
+    private var aaConnectPlayDoneForSession = false
+
+    /**
      * When AA projection returns after MODE (USB/radio), resume only if we were interrupted
      * while playing — not if the user paused or another music app took over.
+     *
+     * Idle-queue auto-play waits for the car audio route to settle and skips if AA already
+     * started playback via MediaSession — racing that is what caused connect-time glitches.
      */
     private val carConnectionObserver =
         Observer<Int> { connectionType ->
             Logger.w(TAG, "CarConnection type=$connectionType resumePending=$resumeOnFocusGain")
             if (connectionType != CarConnection.CONNECTION_TYPE_PROJECTION) {
                 pendingAaIdlePlay = false
+                aaConnectPlayDoneForSession = false
                 // Leaving AA must not auto-play on the phone when focus returns.
                 // Keep resumeOnFocusGain only for temporary losses while still projected (MODE).
                 if (resumeOnFocusGain) {
                     resumeOnFocusGain = false
                     Logger.w(TAG, "CarConnection left projection — cleared resumeOnFocusGain")
                 }
-                carResumeJob?.cancel()
+                aaConnectPlayJob?.cancel()
                 return@Observer
             }
-            carResumeJob?.cancel()
-            carResumeJob =
-                coroutineScope.launch {
-                    // Let the wireless AA audio route settle after MODE.
-                    delay(600)
-                    onAndroidAutoConnected()
-                }
+            scheduleAndroidAutoConnectPlayback("CarConnection")
         }
 
     /**
@@ -709,42 +716,79 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     /**
-     * On Android Auto connect: resume an interrupted session, otherwise start the
-     * restored/idle queue if one is loaded and the user did not pause on purpose.
+     * Debounced entry from Gearhead [onConnect], [CarConnection], or queue restore.
+     * Waits for the AA audio route / host play command to settle, then plays at most once.
      */
+    fun scheduleAndroidAutoConnectPlayback(reason: String) {
+        aaConnectPlayJob?.cancel()
+        aaConnectPlayJob =
+            coroutineScope.launch {
+                Logger.w(TAG, "AA connect play scheduled ($reason) done=$aaConnectPlayDoneForSession")
+                // Wireless AA often issues MediaSession.play while the BT/USB route is still
+                // flipping — playing immediately caused dropouts. Give the host a head start.
+                delay(AA_CONNECT_SETTLE_MS)
+                if (carConnection?.type?.value != CarConnection.CONNECTION_TYPE_PROJECTION) {
+                    Logger.w(TAG, "AA connect play aborted — no longer projected")
+                    return@launch
+                }
+                tryPlayAfterAndroidAutoSettle()
+            }
+    }
+
+    /** @deprecated Prefer [scheduleAndroidAutoConnectPlayback]; kept for call sites. */
     fun onAndroidAutoConnected() {
+        scheduleAndroidAutoConnectPlayback("onAndroidAutoConnected")
+    }
+
+    private fun tryPlayAfterAndroidAutoSettle() {
         Logger.w(
             TAG,
-            "onAndroidAutoConnected: playing=$isPlaying pause=$intentionalPause " +
-                "items=$mediaItemCount state=$internalState pending=$pendingAaIdlePlay",
+            "tryPlayAfterAndroidAutoSettle: playing=$isPlaying pause=$intentionalPause " +
+                "items=$mediaItemCount state=$internalState pending=$pendingAaIdlePlay " +
+                "done=$aaConnectPlayDoneForSession resume=$resumeOnFocusGain",
         )
+        // Interrupted MODE/session resume always wins and does not consume the "idle play" slot
+        // until it actually starts playback.
         resumeIfInterrupted()
         if (isPlaying) {
             pendingAaIdlePlay = false
+            aaConnectPlayDoneForSession = true
+            Logger.w(TAG, "AA connect play skipped — already playing")
+            return
+        }
+        if (aaConnectPlayDoneForSession) {
+            Logger.w(TAG, "AA connect play skipped — already attempted this session")
             return
         }
         if (intentionalPause) {
             pendingAaIdlePlay = false
-            Logger.w(TAG, "onAndroidAutoConnected: skipped — intentional pause")
+            aaConnectPlayDoneForSession = true
+            Logger.w(TAG, "AA connect play skipped — intentional pause")
             return
         }
-        if (mediaItemCount <= 0) {
+        if (mediaItemCount <= 0 || internalState == InternalState.PREPARING) {
             pendingAaIdlePlay = true
-            Logger.w(TAG, "onAndroidAutoConnected: no media yet — will play after restore")
+            Logger.w(TAG, "AA connect play deferred — queue not ready (items=$mediaItemCount state=$internalState)")
             return
         }
-        // Do not gate on isMusicActive: AA/car residual audio often reports active and
-        // would block cold-start play of the saved queue.
+        // Do not gate on isMusicActive: AA/car residual audio often reports active.
+        aaConnectPlayDoneForSession = true
         pendingAaIdlePlay = false
-        Logger.w(TAG, "onAndroidAutoConnected: playing restored/idle queue ($mediaItemCount items)")
+        Logger.w(TAG, "AA connect play: starting restored/idle queue ($mediaItemCount items)")
         play()
     }
 
     /** Call after [mayBeRestoreQueue] finishes so a pending AA connect can start playback. */
     override fun onQueueRestoredAfterColdStart() {
         if (!pendingAaIdlePlay) return
-        Logger.w(TAG, "onQueueRestoredAfterColdStart: fulfilling pending AA play")
-        onAndroidAutoConnected()
+        if (carConnection?.type?.value != CarConnection.CONNECTION_TYPE_PROJECTION) {
+            Logger.w(TAG, "onQueueRestoredAfterColdStart: pending but not projected")
+            return
+        }
+        Logger.w(TAG, "onQueueRestoredAfterColdStart: scheduling pending AA play")
+        // Allow a fresh attempt now that media exists.
+        aaConnectPlayDoneForSession = false
+        scheduleAndroidAutoConnectPlayback("queueRestored")
     }
 
     private fun otherAppPlayingMedia(): Boolean {
@@ -1387,7 +1431,7 @@ internal class CrossfadeExoPlayerAdapter(
         currentLoadJob?.cancel()
         precacheJob?.cancel()
         positionUpdateJob?.cancel()
-        carResumeJob?.cancel()
+        aaConnectPlayJob?.cancel()
 
         runCatching {
             carConnection?.type?.removeObserver(carConnectionObserver)

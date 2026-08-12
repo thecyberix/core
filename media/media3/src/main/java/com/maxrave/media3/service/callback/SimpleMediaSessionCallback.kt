@@ -138,7 +138,7 @@ internal class SimpleMediaSessionCallback(
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.PREVIOUS, Bundle()))
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.GET_PLATFORM_TOKEN, Bundle()))
                 .build()
-        // When Gearhead binds: resume interrupted playback, or start the restored queue if idle.
+        // When Gearhead binds: schedule debounced AA connect play (settles route; one attempt).
         if (customizeForCar && !session.isMediaNotificationController(controller)) {
             scope.launch {
                 delay(500)
@@ -153,7 +153,7 @@ internal class SimpleMediaSessionCallback(
                             if (adapter.mediaItemCount > 0) return@repeat
                         }
                     }
-                    adapter.onAndroidAutoConnected()
+                    adapter.scheduleAndroidAutoConnectPlayback("onConnect")
                 }.onFailure {
                     Logger.e(TAG, "AA connect playback failed: ${it.message}")
                 }
