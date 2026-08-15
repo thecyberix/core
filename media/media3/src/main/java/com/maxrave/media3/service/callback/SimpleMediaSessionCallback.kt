@@ -57,6 +57,7 @@ import com.maxrave.logger.Logger
 import com.maxrave.media3.R
 import com.maxrave.media3.extension.toMediaButtonPreferences
 import com.maxrave.media3.extension.toMediaItem
+import com.maxrave.media3.exoplayer.toMedia3MediaItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -138,27 +139,8 @@ internal class SimpleMediaSessionCallback(
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.PREVIOUS, Bundle()))
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.GET_PLATFORM_TOKEN, Bundle()))
                 .build()
-        // When Gearhead binds: schedule debounced AA connect play (settles route; one attempt).
-        if (customizeForCar && !session.isMediaNotificationController(controller)) {
-            scope.launch {
-                delay(500)
-                runCatching {
-                    val adapter =
-                        mediaPlayerHandler.player as? com.maxrave.media3.exoplayer.CrossfadeExoPlayerAdapter
-                            ?: return@runCatching
-                    // mayBeRestoreQueue is async — wait for tracks (restore also notifies pending).
-                    if (!adapter.isPlaying && adapter.mediaItemCount == 0) {
-                        repeat(20) {
-                            delay(500)
-                            if (adapter.mediaItemCount > 0) return@repeat
-                        }
-                    }
-                    adapter.scheduleAndroidAutoConnectPlayback("onConnect")
-                }.onFailure {
-                    Logger.e(TAG, "AA connect playback failed: ${it.message}")
-                }
-            }
-        }
+        // Do NOT auto-play on Gearhead bind. Android Auto / Media3 send Player.play()
+        // when the car is ready — racing that caused connect-time focus fights.
 
         val playerCommandsBuilder =
             Player.Commands
@@ -186,6 +168,40 @@ internal class SimpleMediaSessionCallback(
         }
         return resultBuilder.build()
     }
+
+    /**
+     * Called when Android Auto / system media controls request play with an empty player.
+     * Restore the saved queue (paused); Media3 then issues [Player.play], which goes through
+     * [com.maxrave.media3.exoplayer.DelegatingForwardingPlayer] → adapter audio focus.
+     */
+    override fun onPlaybackResumption(
+        mediaSession: MediaSession,
+        controller: MediaSession.ControllerInfo,
+        isForPlayback: Boolean,
+    ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+        scope.future {
+            Logger.w(
+                TAG,
+                "onPlaybackResumption isForPlayback=$isForPlayback pkg=${controller.packageName} " +
+                    "items=${mediaPlayerHandler.player.mediaItemCount}",
+            )
+            if (mediaPlayerHandler.player.mediaItemCount == 0) {
+                mediaPlayerHandler.mayBeRestoreQueue()
+                repeat(40) {
+                    delay(250)
+                    if (mediaPlayerHandler.player.mediaItemCount > 0) return@repeat
+                }
+            }
+            val player = mediaPlayerHandler.player
+            if (player.mediaItemCount <= 0) {
+                throw UnsupportedOperationException("No saved queue to resume")
+            }
+            val items = player.getCurrentMediaTimeLine().map { it.toMedia3MediaItem() }
+            val index = player.currentMediaItemIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0))
+            val position = player.currentPosition.coerceAtLeast(0L)
+            Logger.w(TAG, "onPlaybackResumption ready index=$index pos=${position}ms count=${items.size}")
+            MediaSession.MediaItemsWithStartPosition(items, index, position)
+        }
 
     /**
      * Steering-wheel "previous" arrives as [KeyEvent.KEYCODE_MEDIA_PREVIOUS].
