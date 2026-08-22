@@ -7,7 +7,6 @@ import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import androidx.car.app.connection.CarConnection
 import androidx.lifecycle.Observer
 import androidx.media3.common.AudioAttributes
@@ -58,20 +57,8 @@ import kotlin.math.sin
 
 private const val TAG = "CrossfadeExoPlayerAdapter"
 
-/**
- * Delay after the first AA projection / Gearhead bind before we may start idle playback.
- * Later onConnect/CarConnection events must not reset this clock.
- */
-private const val AA_CONNECT_SETTLE_MS = 3_000L
-
-/**
- * Wireless AA (Gearhead) often keeps exclusive focus 15–25s during connect.
- * Timed-out forced play still stole that focus and caused dropouts — wait this long,
- * then abort rather than fight the host.
- */
-private const val AA_CONNECT_HOST_WAIT_MS = 45_000L
-
-private const val AA_CONNECT_HOST_POLL_MS = 250L
+/** Debounce CarConnection flicker during Gearhead nav before treating as AA disconnect. */
+private const val AA_LEAVE_PROJECTION_DEBOUNCE_MS = 2_000L
 
 /**
  * ExoPlayer implementation of [MediaPlayerInterface] with crossfade support.
@@ -223,63 +210,55 @@ internal class CrossfadeExoPlayerAdapter(
 
     private var carConnection: CarConnection? = null
 
-    private var aaConnectPlayJob: Job? = null
+    private var leaveProjectionJob: Job? = null
 
     /**
-     * AA connected before [mayBeRestoreQueue] finished loading tracks — play once the queue appears.
+     * Set when [CarConnection] reports projection; cleared only after debounced disconnect.
+     * Used to arm auto-resume on focus regain in the car, not on the phone.
      */
     @Volatile
-    private var pendingAaIdlePlay = false
+    private var inAndroidAutoSession = false
 
-    /**
-     * One auto-play / resume attempt per projection session (CarConnection + onConnect both fire).
-     */
-    @Volatile
-    private var aaConnectPlayDoneForSession = false
-
-    /** elapsedRealtime deadline for the first connect of this projection session; 0 = unset. */
-    @Volatile
-    private var aaConnectPlayDeadlineElapsed = 0L
-
-    /**
-     * When AA projection returns after MODE (USB/radio), resume only if we were interrupted
-     * while playing — not if the user paused or another music app took over.
-     *
-     * Idle-queue start is left to Android Auto: after the host settles it sends
-     * MediaSession play, which hits [DelegatingForwardingPlayer] → [play].
-     */
     private val carConnectionObserver =
         Observer<Int> { connectionType ->
-            Logger.w(TAG, "CarConnection type=$connectionType resumePending=$resumeOnFocusGain")
-            if (connectionType != CarConnection.CONNECTION_TYPE_PROJECTION) {
-                pendingAaIdlePlay = false
-                aaConnectPlayDoneForSession = false
-                aaConnectPlayDeadlineElapsed = 0L
-                // Leaving AA must not auto-play on the phone when focus returns.
-                // Keep resumeOnFocusGain only for temporary losses while still projected (MODE).
-                if (resumeOnFocusGain) {
-                    resumeOnFocusGain = false
-                    Logger.w(TAG, "CarConnection left projection — cleared resumeOnFocusGain")
-                }
-                aaConnectPlayJob?.cancel()
-                return@Observer
-            }
-            // MODE return only — never idle auto-start (that races Gearhead).
-            if (resumeOnFocusGain) {
-                scheduleAndroidAutoConnectPlayback("CarConnection-modeResume")
+            Logger.w(
+                TAG,
+                "CarConnection type=$connectionType aaSession=$inAndroidAutoSession " +
+                    "resumePending=$resumeOnFocusGain",
+            )
+            if (connectionType == CarConnection.CONNECTION_TYPE_PROJECTION) {
+                leaveProjectionJob?.cancel()
+                inAndroidAutoSession = true
+            } else {
+                scheduleLeaveAndroidAuto()
             }
         }
 
+    private fun scheduleLeaveAndroidAuto() {
+        leaveProjectionJob?.cancel()
+        leaveProjectionJob =
+            coroutineScope.launch {
+                delay(AA_LEAVE_PROJECTION_DEBOUNCE_MS)
+                if (carConnection?.type?.value == CarConnection.CONNECTION_TYPE_PROJECTION) {
+                    return@launch
+                }
+                Logger.w(TAG, "Left AA projection — stopping playback")
+                inAndroidAutoSession = false
+                resumeOnFocusGain = false
+                if (internalState == InternalState.PLAYING) {
+                    pauseInternal(intentional = true)
+                }
+                abandonAudioFocusInternal()
+            }
+    }
+
     /**
-     * If YouTube Music / Spotify starts playing after we lost focus, drop auto-resume so we
-     * don't steal their session when AA reconnects.
+     * If another music app starts while we are paused waiting to resume, drop auto-resume.
      */
     private val audioPlaybackCallback =
         object : AudioManager.AudioPlaybackCallback() {
             override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
                 if (!resumeOnFocusGain) return
-                // Public AudioPlaybackConfiguration has no client uid; if music is active while
-                // we are not playing, another app took the stream.
                 if (internalState != InternalState.PLAYING && audioManager?.isMusicActive == true) {
                     resumeOnFocusGain = false
                     Logger.d(TAG, "Cleared resumeOnFocusGain: another app is playing media")
@@ -291,54 +270,43 @@ internal class CrossfadeExoPlayerAdapter(
         AudioManager.OnAudioFocusChangeListener { focusChange ->
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_GAIN -> {
-                    // Don't fight the crossfade ramp; while crossfading it owns the volume.
                     if (!isCrossfading) currentPlayer?.volume = internalVolume
                     if (resumeOnFocusGain) {
-                        // During AA connect Gearhead often holds exclusive focus for a long time.
-                        // Resuming the instant we get GAIN can still race their teardown — defer
-                        // through the same settle path so we only start when the host is idle.
-                        if (carConnection?.type?.value == CarConnection.CONNECTION_TYPE_PROJECTION &&
-                            androidAutoHostOccupyingAudio()
-                        ) {
-                            Logger.w(TAG, "AUDIOFOCUS_GAIN deferred — AA host still occupying")
-                            scheduleAndroidAutoConnectPlayback("focusGain")
-                        } else {
-                            resumeOnFocusGain = false
-                            play()
-                        }
+                        resumeOnFocusGain = false
+                        play()
                     }
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS -> {
-                    // Car MODE → USB/radio reports permanent loss. Remember to resume when
-                    // AA reconnects unless the user already paused intentionally.
                     hasAudioFocus = false
                     when {
-                        internalState == InternalState.PLAYING -> {
+                        inAndroidAutoSession && internalState == InternalState.PLAYING -> {
                             resumeOnFocusGain = true
                             pauseInternal(intentional = false)
-                            Logger.d(TAG, "AUDIOFOCUS_LOSS while playing → resume armed")
+                            Logger.d(TAG, "AUDIOFOCUS_LOSS while playing on AA → resume armed")
                         }
-                        resumeOnFocusGain && !intentionalPause -> {
-                            // AudioBecomingNoisy already paused and armed resume — keep it.
+                        inAndroidAutoSession && resumeOnFocusGain && !intentionalPause -> {
                             Logger.d(TAG, "AUDIOFOCUS_LOSS keeping resumeOnFocusGain")
                         }
                         else -> {
+                            if (internalState == InternalState.PLAYING) {
+                                pauseInternal(intentional = false)
+                            }
                             resumeOnFocusGain = false
-                            Logger.d(TAG, "AUDIOFOCUS_LOSS (no auto-resume)")
                         }
                     }
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                    // Temporary loss (e.g. an incoming call): pause and remember to resume.
-                    resumeOnFocusGain = internalState == InternalState.PLAYING || resumeOnFocusGain
-                    pauseInternal(intentional = false)
+                    if (inAndroidAutoSession) {
+                        resumeOnFocusGain = internalState == InternalState.PLAYING || resumeOnFocusGain
+                        pauseInternal(intentional = false)
+                    } else if (internalState == InternalState.PLAYING) {
+                        pauseInternal(intentional = false)
+                    }
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                    // Lower the volume instead of pausing (e.g. a navigation prompt).
-                    // Skip during crossfade — the ramp owns volume and would override this.
                     if (!isCrossfading) currentPlayer?.volume = internalVolume * duckVolumeFactor
                 }
             }
@@ -653,8 +621,8 @@ internal class CrossfadeExoPlayerAdapter(
                         .setBufferDurationsMs(
                             DefaultLoadControl.DEFAULT_MIN_BUFFER_MS * 4,
                             DefaultLoadControl.DEFAULT_MAX_BUFFER_MS * 4,
-                            0,
-                            0,
+                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
                         ).build(),
                 ).setWakeMode(C.WAKE_MODE_NETWORK)
                 .setHandleAudioBecomingNoisy(true)
@@ -727,84 +695,6 @@ internal class CrossfadeExoPlayerAdapter(
         pauseInternal(intentional = true)
     }
 
-    /**
-     * Resume after a car audio-source switch (MODE → USB/radio → AA) if playback was
-     * interrupted rather than paused by the user / taken over by another music app.
-     */
-    fun resumeIfInterrupted() {
-        if (!resumeOnFocusGain) {
-            Logger.d(TAG, "resumeIfInterrupted: nothing pending")
-            return
-        }
-        if (otherAppPlayingMedia()) {
-            resumeOnFocusGain = false
-            Logger.d(TAG, "resumeIfInterrupted: skipped — other app playing")
-            return
-        }
-        Logger.w(TAG, "resumeIfInterrupted: resuming after car/source interruption")
-        resumeOnFocusGain = false
-        play()
-    }
-
-    /**
-     * Debounced MODE resume after Gearhead finishes holding exclusive connect focus.
-     * Idle auto-play is intentionally not done here — AA drives that via MediaSession play.
-     */
-    fun scheduleAndroidAutoConnectPlayback(reason: String) {
-        if (!resumeOnFocusGain) {
-            Logger.w(TAG, "AA connect schedule skipped — no resume pending ($reason)")
-            return
-        }
-        if (isPlaying) {
-            resumeOnFocusGain = false
-            aaConnectPlayDoneForSession = true
-            Logger.w(TAG, "AA connect schedule skipped — already playing ($reason)")
-            return
-        }
-        val now = SystemClock.elapsedRealtime()
-        if (aaConnectPlayDeadlineElapsed == 0L) {
-            aaConnectPlayDeadlineElapsed = now + AA_CONNECT_SETTLE_MS
-        }
-        val waitMs = (aaConnectPlayDeadlineElapsed - now).coerceAtLeast(0L)
-        aaConnectPlayJob?.cancel()
-        aaConnectPlayJob =
-            coroutineScope.launch {
-                Logger.w(
-                    TAG,
-                    "AA MODE resume scheduled ($reason) wait=${waitMs}ms",
-                )
-                delay(waitMs)
-                val hostWaitDeadline = SystemClock.elapsedRealtime() + AA_CONNECT_HOST_WAIT_MS
-                while (androidAutoHostOccupyingAudio() &&
-                    SystemClock.elapsedRealtime() < hostWaitDeadline
-                ) {
-                    if (isPlaying) {
-                        resumeOnFocusGain = false
-                        return@launch
-                    }
-                    delay(AA_CONNECT_HOST_POLL_MS)
-                }
-                if (androidAutoHostOccupyingAudio()) {
-                    Logger.w(TAG, "AA MODE resume deferred — host still occupying; keep resume armed")
-                    return@launch
-                }
-                if (carConnection?.type?.value != CarConnection.CONNECTION_TYPE_PROJECTION) {
-                    return@launch
-                }
-                resumeIfInterrupted()
-            }
-    }
-
-    /** @deprecated Prefer [scheduleAndroidAutoConnectPlayback]; kept for call sites. */
-    fun onAndroidAutoConnected() {
-        scheduleAndroidAutoConnectPlayback("onAndroidAutoConnected")
-    }
-
-    private fun tryPlayAfterAndroidAutoSettle() {
-        // Idle auto-play removed — MediaSession play from AA is the start path.
-        resumeIfInterrupted()
-    }
-
     /** Queue restore finished; AA MediaSession play will start when the host is ready. */
     override fun onQueueRestoredAfterColdStart() {
         Logger.w(
@@ -812,23 +702,6 @@ internal class CrossfadeExoPlayerAdapter(
             "onQueueRestoredAfterColdStart: items=$mediaItemCount playing=$isPlaying " +
                 "(waiting for MediaSession play from AA if projected)",
         )
-        pendingAaIdlePlay = false
-    }
-
-    private fun otherAppPlayingMedia(): Boolean {
-        // We're paused for resume; active music means another app owns playback.
-        if (internalState == InternalState.PLAYING) return false
-        return audioManager?.isMusicActive == true
-    }
-
-    /** True while Gearhead still holds the AA connect / routing stream. */
-    private fun androidAutoHostOccupyingAudio(): Boolean {
-        val am = audioManager ?: return false
-        return am.activePlaybackConfigurations.any { cfg ->
-            val usage = cfg.audioAttributes.usage
-            usage == android.media.AudioAttributes.USAGE_UNKNOWN ||
-                usage == android.media.AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
-        }
     }
 
     private fun pauseInternal(intentional: Boolean) {
@@ -1465,9 +1338,7 @@ internal class CrossfadeExoPlayerAdapter(
         currentLoadJob?.cancel()
         precacheJob?.cancel()
         positionUpdateJob?.cancel()
-        aaConnectPlayJob?.cancel()
-        aaConnectPlayDeadlineElapsed = 0L
-
+        leaveProjectionJob?.cancel()
         runCatching {
             carConnection?.type?.removeObserver(carConnectionObserver)
         }
@@ -1698,7 +1569,8 @@ internal class CrossfadeExoPlayerAdapter(
                         cachedPosition = startPositionMs
                     }
 
-                    // Auto-play if requested
+                    // Auto-play if requested. ExoPlayer keeps playWhenReady=true in BUFFERING until
+                    // bufferForPlaybackMs (Media3 default 2500 ms) is filled — no audible output before that.
                     if (shouldPlay) {
                         if (!requestAudioFocusInternal()) {
                             Logger.w(TAG, "Auto-play aborted: audio focus not granted")
@@ -1706,8 +1578,11 @@ internal class CrossfadeExoPlayerAdapter(
                             transitionToState(InternalState.READY)
                             internalPlayWhenReady = false
                         } else {
+                            internalPlayWhenReady = true
                             player.play()
-                            transitionToState(InternalState.PLAYING)
+                            if (player.isPlaying) {
+                                transitionToState(InternalState.PLAYING)
+                            }
                         }
                     } else {
                         player.pause()
@@ -1803,9 +1678,9 @@ internal class CrossfadeExoPlayerAdapter(
                             if (!player.playWhenReady) {
                                 // ExoPlayer paused itself (AudioBecomingNoisy on MODE/USB switch,
                                 // etc.) — arm auto-resume unless we paused on purpose.
-                                if (!intentionalPause) {
+                                if (!intentionalPause && inAndroidAutoSession) {
                                     resumeOnFocusGain = true
-                                    Logger.d(TAG, "External pause → resumeOnFocusGain=true")
+                                    Logger.d(TAG, "External pause on AA → resumeOnFocusGain=true")
                                 }
                                 intentionalPause = false
                                 transitionToState(InternalState.PAUSED)

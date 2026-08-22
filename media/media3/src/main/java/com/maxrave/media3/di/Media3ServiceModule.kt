@@ -509,10 +509,8 @@ private fun provideLoadControl(): LoadControl =
         .setBufferDurationsMs(
             DEFAULT_MIN_BUFFER_MS * 4,
             DEFAULT_MAX_BUFFER_MS * 4,
-            // bufferForPlaybackMs=
-            0,
-            // bufferForPlaybackAfterRebufferMs=
-            0,
+            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
         ).build()
 
 @UnstableApi
