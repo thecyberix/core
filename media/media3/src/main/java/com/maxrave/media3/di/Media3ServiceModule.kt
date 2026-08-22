@@ -193,6 +193,7 @@ private val mediaServiceModule =
                 mediaSourceFactory = get(),
                 audioAttributes = get(),
                 streamRepository = get(),
+                playerCache = get(named(PLAYER_CACHE)),
             )
         }
 
@@ -264,35 +265,23 @@ private fun provideResolvingDataSourceFactory(
             Logger.w("Stream", "Downloaded $mediaId")
             return@Factory dataSpec.subrange(dataSpec.uriPositionOffset, chunkLength)
         }
-        if (playerCache.isFullyCached(mediaId, dataSpec.position)) {
-            // See the note above: once per track, not once per chunk.
-            if (dataSpec.position == 0L) {
-                coroutineScope.launch(Dispatchers.IO) {
-                    streamRepository.updateFormat(
-                        if (mediaId.contains(MERGING_DATA_TYPE.VIDEO)) {
-                            mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
-                        } else {
-                            mediaId
-                        },
-                    )
-                }
+        // Do NOT short-circuit on playerCache.isFullyCached with a bare media id.
+        // After a reboot / partial eviction the on-disk spans can look complete while being
+        // corrupt; a scheme-less URI has no OkHttp fallback, so MediaCodec fails hard
+        // (FLAG_IGNORE_CACHE_ON_ERROR only works when the DataSpec has a real URL).
+        // Always resolve a googlevideo URL below — CacheDataSource still serves from
+        // playerCache first, and falls back to network on cache read errors.
+        if (playerCache.isFullyCached(mediaId, dataSpec.position) && dataSpec.position == 0L) {
+            coroutineScope.launch(Dispatchers.IO) {
+                streamRepository.updateFormat(
+                    if (mediaId.contains(MERGING_DATA_TYPE.VIDEO)) {
+                        mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
+                    } else {
+                        mediaId
+                    },
+                )
             }
-            Logger.w("Stream", "Cached $mediaId")
-            // Every byte is on disk right now, so CacheDataSource can serve this chunk
-            // without ever reaching upstream, and the bare media id is safe as the URI.
-            //
-            // It is only safe for ONE chunk though. A bare id has no scheme, so
-            // DefaultDataSource routes it to FileDataSource, not to OkHttp — the failure
-            // is FileNotFoundException (ERROR_CODE_IO_FILE_NOT_FOUND), which Media3 lists
-            // as non-retriable and which CrossfadeExoPlayerAdapter does not recover from
-            // either. Meanwhile CacheDataSource.read() walks span to span inside a single
-            // open() without consulting this resolver again, so an unbounded DataSpec
-            // would stake the whole remaining track on a snapshot taken here: one LRU
-            // eviction (precache and downloads write to playerCache concurrently) or one
-            // "clear cache" tap mid-song and playback dies with no way back.
-            // Capping to chunkLength forces a re-check at every chunk boundary, so a
-            // cache that shrinks under us falls back to resolving a real URL.
-            return@Factory dataSpec.subrange(dataSpec.uriPositionOffset, chunkLength)
+            Logger.w("Stream", "Cached $mediaId — still resolving URL for network fallback")
         }
         var dataSpecReturn: DataSpec = dataSpec
         var resolved = false

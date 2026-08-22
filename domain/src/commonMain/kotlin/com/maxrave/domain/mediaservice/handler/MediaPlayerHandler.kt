@@ -151,6 +151,9 @@ interface MediaPlayerHandler {
 
     fun mayBeRestoreQueue()
 
+    /** Wait for [mayBeRestoreQueue] and any in-flight track prepare to finish. */
+    suspend fun awaitQueueRestore() {}
+
     // Lifecycle
     fun shouldReleaseOnTaskRemoved(): Boolean
 

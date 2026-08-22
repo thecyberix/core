@@ -863,6 +863,24 @@ class MpvPlayerAdapter(
         listeners.remove(listener)
     }
 
+    override fun setPlaylistItems(
+        items: List<GenericMediaItem>,
+        currentIndex: Int,
+    ) {
+        playlist.clear()
+        playlist.addAll(items)
+        localCurrentMediaItemIndex = if (items.isEmpty()) -1 else currentIndex.coerceIn(0, items.lastIndex)
+    }
+
+    override suspend fun prepareTrackAt(
+        index: Int,
+        positionMs: Long,
+    ) {
+        seekTo(index, positionMs)
+    }
+
+    override suspend fun awaitPendingLoad() {}
+
     // ========== Release Resources ==========
 
     override fun release() {

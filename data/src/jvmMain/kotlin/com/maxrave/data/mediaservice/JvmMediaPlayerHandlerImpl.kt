@@ -2341,6 +2341,10 @@ class JvmMediaPlayerHandlerImpl(
         }
     }
 
+    override suspend fun awaitQueueRestore() {
+        player.awaitPendingLoad()
+    }
+
     override fun shouldReleaseOnTaskRemoved() =
         runBlocking {
             dataStoreManager.killServiceOnExit.first() == TRUE

@@ -234,6 +234,26 @@ class ExoPlayerAdapter(
         listeners.remove(listener)
     }
 
+    override fun setPlaylistItems(
+        items: List<GenericMediaItem>,
+        currentIndex: Int,
+    ) {
+        exoPlayer.clearMediaItems()
+        exoPlayer.addMediaItems(items.map { it.toMedia3MediaItem() })
+        if (items.isNotEmpty()) {
+            exoPlayer.seekTo(currentIndex.coerceIn(0, items.lastIndex), 0)
+        }
+    }
+
+    override suspend fun prepareTrackAt(
+        index: Int,
+        positionMs: Long,
+    ) {
+        seekTo(index, positionMs)
+    }
+
+    override suspend fun awaitPendingLoad() {}
+
     // Release resources
     override fun release() {
         exoPlayer.removeListener(exoPlayerListener)

@@ -60,6 +60,15 @@ internal class DelegatingForwardingPlayer(
 
         fun hasPreviousMediaItem(): Boolean
 
+        /**
+         * Seek within the adapter playlist. Used when MediaSession playback resumption
+         * supplies a start index that must not be applied to the single-item ExoPlayer.
+         */
+        fun seekTo(
+            mediaItemIndex: Int,
+            positionMs: Long,
+        )
+
         fun seekToNext()
 
         fun seekToPrevious()
@@ -143,9 +152,10 @@ internal class DelegatingForwardingPlayer(
         startPositionMs: Long,
     ) {
         if (shouldIgnoreSessionPlaylistReplace(mediaItems)) {
-            if (startPositionMs >= 0 && currentMediaItem != null) {
-                seekTo(startPositionMs)
-            }
+            Logger.d(
+                TAG,
+                "Ignoring MediaSession setMediaItems (${mediaItems.size}, idx=$startIndex) — adapter already prepared",
+            )
             return
         }
         super.setMediaItems(mediaItems, startIndex, startPositionMs)
@@ -398,6 +408,18 @@ internal class DelegatingForwardingPlayer(
             nav.seekToPreviousMediaItem()
         } else {
             super.seekToPreviousMediaItem()
+        }
+    }
+
+    override fun seekTo(
+        mediaItemIndex: Int,
+        positionMs: Long,
+    ) {
+        val nav = playlistNavigationProvider
+        if (nav != null) {
+            nav.seekTo(mediaItemIndex, positionMs)
+        } else {
+            super.seekTo(mediaItemIndex, positionMs)
         }
     }
 

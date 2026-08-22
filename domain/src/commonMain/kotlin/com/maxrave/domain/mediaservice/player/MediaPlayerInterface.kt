@@ -104,10 +104,30 @@ interface MediaPlayerInterface {
     fun removeListener(listener: MediaPlayerListener)
 
     /**
-     * Invoked after cold-start queue restore finishes. Default no-op; Android Auto
-     * adapters may start playback if a car connect was waiting for the queue.
+     * Replace the in-memory playlist without starting playback.
+     * Used by cold-start queue restore before [prepareTrackAt].
+     */
+    fun setPlaylistItems(
+        items: List<GenericMediaItem>,
+        currentIndex: Int,
+    )
+
+    /**
+     * Load and buffer the track at [index]/[positionMs] without playing.
+     * Suspends until the stream is ready at that position (Android Auto restore).
+     */
+    suspend fun prepareTrackAt(
+        index: Int,
+        positionMs: Long,
+    )
+
+    /**
+     * Invoked after cold-start queue restore finishes.
      */
     fun onQueueRestoredAfterColdStart() {}
+
+    /** Wait until an in-flight [prepareTrackAt] / load completes. */
+    suspend fun awaitPendingLoad() {}
 
     // Release resources
     fun release()

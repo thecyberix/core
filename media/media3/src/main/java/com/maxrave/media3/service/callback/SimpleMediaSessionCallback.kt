@@ -60,7 +60,6 @@ import com.maxrave.media3.extension.toMediaItem
 import com.maxrave.media3.exoplayer.toMedia3MediaItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.last
 import kotlinx.coroutines.flow.lastOrNull
@@ -187,11 +186,8 @@ internal class SimpleMediaSessionCallback(
             )
             if (mediaPlayerHandler.player.mediaItemCount == 0) {
                 mediaPlayerHandler.mayBeRestoreQueue()
-                repeat(40) {
-                    delay(250)
-                    if (mediaPlayerHandler.player.mediaItemCount > 0) return@repeat
-                }
             }
+            mediaPlayerHandler.awaitQueueRestore()
             val player = mediaPlayerHandler.player
             if (player.mediaItemCount <= 0) {
                 throw UnsupportedOperationException("No saved queue to resume")
