@@ -237,11 +237,15 @@ class ExoPlayerAdapter(
     override fun setPlaylistItems(
         items: List<GenericMediaItem>,
         currentIndex: Int,
+        startPositionMs: Long,
     ) {
         exoPlayer.clearMediaItems()
         exoPlayer.addMediaItems(items.map { it.toMedia3MediaItem() })
         if (items.isNotEmpty()) {
-            exoPlayer.seekTo(currentIndex.coerceIn(0, items.lastIndex), 0)
+            exoPlayer.seekTo(
+                currentIndex.coerceIn(0, items.lastIndex),
+                startPositionMs.coerceAtLeast(0L),
+            )
         }
     }
 

@@ -2274,8 +2274,12 @@ internal class MediaServiceHandlerImpl(
                                 ),
                             )
                             val mediaItems = listTracks.map { it.toGenericMediaItem() }
-                            player.setPlaylistItems(mediaItems, index)
-                            player.prepareTrackAt(index, savedPosition)
+                            // Playlist + resume position only — do NOT prepareTrackAt.
+                            // AA/MediaSession play() then hits the IDLE → loadAndPlay path,
+                            // the same continuous prepare→buffer→play as a manual song tap.
+                            // Pre-preparing paused then later AudioTrack.start() caused cold-start
+                            // underrun jitter even with prefetch/evict/buffer waits.
+                            player.setPlaylistItems(mediaItems, index, savedPosition)
                             _queueData.update {
                                 it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED)
                             }

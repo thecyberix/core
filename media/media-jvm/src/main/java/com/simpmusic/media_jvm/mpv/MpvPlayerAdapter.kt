@@ -866,10 +866,12 @@ class MpvPlayerAdapter(
     override fun setPlaylistItems(
         items: List<GenericMediaItem>,
         currentIndex: Int,
+        startPositionMs: Long,
     ) {
         playlist.clear()
         playlist.addAll(items)
         localCurrentMediaItemIndex = if (items.isEmpty()) -1 else currentIndex.coerceIn(0, items.lastIndex)
+        cachedPosition = startPositionMs.coerceAtLeast(0L)
     }
 
     override suspend fun prepareTrackAt(

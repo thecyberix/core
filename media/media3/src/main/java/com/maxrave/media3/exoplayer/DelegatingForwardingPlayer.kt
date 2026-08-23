@@ -130,8 +130,11 @@ internal class DelegatingForwardingPlayer(
     /**
      * [CrossfadeExoPlayerAdapter] owns the real playlist (one MediaItem per ExoPlayer).
      * Media3 playback-resumption still calls [setMediaItems] after [MediaSession.Callback.onPlaybackResumption];
-     * applying that list to the single-item ExoPlayer would break the adapter. Ignore when we already
-     * prepared content — [play] is what actually starts audio.
+     * applying that list to the single-item ExoPlayer would break the adapter.
+     *
+     * Ignore whenever the adapter owns playback control — including after cold restore,
+     * when the playlist is in memory but ExoPlayer still has no MediaItem until [play]
+     * runs loadAndPlay (same path as a manual song tap).
      */
     override fun setMediaItems(mediaItems: List<MediaItem>) {
         if (shouldIgnoreSessionPlaylistReplace(mediaItems)) return
@@ -154,7 +157,7 @@ internal class DelegatingForwardingPlayer(
         if (shouldIgnoreSessionPlaylistReplace(mediaItems)) {
             Logger.d(
                 TAG,
-                "Ignoring MediaSession setMediaItems (${mediaItems.size}, idx=$startIndex) — adapter already prepared",
+                "Ignoring MediaSession setMediaItems (${mediaItems.size}, idx=$startIndex) — adapter owns playlist",
             )
             return
         }
@@ -163,7 +166,6 @@ internal class DelegatingForwardingPlayer(
 
     private fun shouldIgnoreSessionPlaylistReplace(mediaItems: List<MediaItem>): Boolean {
         if (playbackControlProvider == null) return false
-        if (currentMediaItem == null) return false
         Logger.d(
             TAG,
             "Ignoring MediaSession setMediaItems (${mediaItems.size}) — adapter owns playlist",

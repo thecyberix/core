@@ -104,17 +104,19 @@ interface MediaPlayerInterface {
     fun removeListener(listener: MediaPlayerListener)
 
     /**
-     * Replace the in-memory playlist without starting playback.
-     * Used by cold-start queue restore before [prepareTrackAt].
+     * Replace the in-memory playlist without preparing or playing.
+     * Used by cold-start queue restore; [play] then runs the same load-and-play
+     * path as a manual song tap ([startPositionMs] is the resume offset).
      */
     fun setPlaylistItems(
         items: List<GenericMediaItem>,
         currentIndex: Int,
+        startPositionMs: Long = 0L,
     )
 
     /**
      * Load and buffer the track at [index]/[positionMs] without playing.
-     * Suspends until the stream is ready at that position (Android Auto restore).
+     * Prefer restore via [setPlaylistItems] + [play] so AA matches manual play.
      */
     suspend fun prepareTrackAt(
         index: Int,
@@ -122,7 +124,7 @@ interface MediaPlayerInterface {
     )
 
     /**
-     * Invoked after cold-start queue restore finishes.
+     * Invoked after cold-start queue restore finishes (playlist only; not prepared).
      */
     fun onQueueRestoredAfterColdStart() {}
 

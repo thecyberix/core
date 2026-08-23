@@ -762,7 +762,11 @@ internal class CrossfadeExoPlayerAdapter(
                         Logger.w(TAG, "Play: IDLE with empty playlist")
                         return@launch
                     }
-                    Logger.w(TAG, "Play: IDLE → loadAndPlay index=$localCurrentMediaItemIndex")
+                    Logger.w(
+                        TAG,
+                        "Play: IDLE → loadAndPlay index=$localCurrentMediaItemIndex " +
+                            "pos=${cachedPosition}ms (same path as manual song tap)",
+                    )
                     loadAndPlayTrackInternal(
                         localCurrentMediaItemIndex,
                         cachedPosition.coerceAtLeast(0L),
@@ -781,12 +785,13 @@ internal class CrossfadeExoPlayerAdapter(
         pauseInternal(intentional = true)
     }
 
-    /** Queue restore finished; AA MediaSession play will start when the host is ready. */
+    /** Queue restore finished (playlist only). Next play() loads like a manual song tap. */
     override fun onQueueRestoredAfterColdStart() {
         Logger.w(
             TAG,
-            "onQueueRestoredAfterColdStart: items=$mediaItemCount playing=$isPlaying " +
-                "(waiting for MediaSession play from AA if projected)",
+            "onQueueRestoredAfterColdStart: items=$mediaItemCount index=$currentMediaItemIndex " +
+                "pos=${cachedPosition}ms state=$internalState " +
+                "(IDLE — waiting for play() → loadAndPlay, same as manual)",
         )
     }
 
@@ -996,6 +1001,7 @@ internal class CrossfadeExoPlayerAdapter(
     override fun setPlaylistItems(
         items: List<GenericMediaItem>,
         currentIndex: Int,
+        startPositionMs: Long,
     ) {
         currentLoadJob?.cancel()
         cancelPrecaching()
@@ -1004,9 +1010,15 @@ internal class CrossfadeExoPlayerAdapter(
         if (items.isNotEmpty()) {
             playlist.addAll(items)
             localCurrentMediaItemIndex = currentIndex.coerceIn(0, items.lastIndex)
+            cachedPosition = startPositionMs.coerceAtLeast(0L)
         } else {
             localCurrentMediaItemIndex = -1
+            cachedPosition = 0L
         }
+        // Stay IDLE so the next play() runs loadAndPlayTrackInternal (manual-play path),
+        // not a bare AudioTrack.start() on a player that was prepared earlier.
+        internalPlayWhenReady = false
+        transitionToState(InternalState.IDLE)
         if (internalShuffleModeEnabled) {
             createShuffleOrder()
         }
@@ -1651,13 +1663,14 @@ internal class CrossfadeExoPlayerAdapter(
             TAG,
             "Buffer ready at ${player.currentPosition}ms " +
                 "(bufferedPos=${player.bufferedPosition}, totalBuffered=${player.totalBufferedDuration}, " +
-                "wanted=${minAheadMs}ms)",
+                "wanted=${minAheadMs}ms, startPos=${startPositionMs}ms)",
         )
     }
 
     /**
-     * Resolve and cache the stream URL/format before ExoPlayer prepare — same work
-     * [ResolvingDataSource] would block on during manual in-app play.
+     * Resolve and cache the stream URL/format before ExoPlayer prepare.
+     * Always call getStream — skipping when the DB format looked "fresh" brought
+     * cold-start AA jitter back (conditional prefetch experiment).
      */
     private suspend fun prefetchStreamForMediaItem(mediaItem: GenericMediaItem) {
         val videoId = mediaItem.mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
@@ -1683,6 +1696,8 @@ internal class CrossfadeExoPlayerAdapter(
      * Drop player-cache spans before prepare. Post-reboot spans can look complete but
      * decode as garbage; FLAG_IGNORE_CACHE_ON_ERROR does not catch that (decode fails
      * after a "successful" read). Evicting forces a clean fill behind a real URL.
+     *
+     * Always evict (not once-per-process): skipping repeats brought cold-start jitter back.
      */
     private fun evictPlayerCacheFor(mediaId: String) {
         runCatching {

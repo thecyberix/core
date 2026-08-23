@@ -170,8 +170,8 @@ internal class SimpleMediaSessionCallback(
 
     /**
      * Called when Android Auto / system media controls request play with an empty player.
-     * Restore the saved queue (paused); Media3 then issues [Player.play], which goes through
-     * [com.maxrave.media3.exoplayer.DelegatingForwardingPlayer] → adapter audio focus.
+     * Restore the saved queue as playlist only (no prepare); Media3 then issues [Player.play],
+     * which hits adapter IDLE → loadAndPlay — the same path as a manual song tap.
      */
     override fun onPlaybackResumption(
         mediaSession: MediaSession,
