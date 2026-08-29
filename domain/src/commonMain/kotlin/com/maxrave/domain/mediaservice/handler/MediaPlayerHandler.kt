@@ -151,7 +151,7 @@ interface MediaPlayerHandler {
 
     fun mayBeRestoreQueue()
 
-    /** Wait for [mayBeRestoreQueue] and any in-flight track prepare to finish. */
+    /** Wait for [mayBeRestoreQueue] and any in-flight track load to finish. */
     suspend fun awaitQueueRestore() {}
 
     // Lifecycle

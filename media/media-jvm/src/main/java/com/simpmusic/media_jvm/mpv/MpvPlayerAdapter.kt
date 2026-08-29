@@ -874,13 +874,6 @@ class MpvPlayerAdapter(
         cachedPosition = startPositionMs.coerceAtLeast(0L)
     }
 
-    override suspend fun prepareTrackAt(
-        index: Int,
-        positionMs: Long,
-    ) {
-        seekTo(index, positionMs)
-    }
-
     override suspend fun awaitPendingLoad() {}
 
     // ========== Release Resources ==========

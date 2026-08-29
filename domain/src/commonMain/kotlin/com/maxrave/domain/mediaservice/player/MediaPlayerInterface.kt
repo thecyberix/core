@@ -114,21 +114,7 @@ interface MediaPlayerInterface {
         startPositionMs: Long = 0L,
     )
 
-    /**
-     * Load and buffer the track at [index]/[positionMs] without playing.
-     * Prefer restore via [setPlaylistItems] + [play] so AA matches manual play.
-     */
-    suspend fun prepareTrackAt(
-        index: Int,
-        positionMs: Long,
-    )
-
-    /**
-     * Invoked after cold-start queue restore finishes (playlist only; not prepared).
-     */
-    fun onQueueRestoredAfterColdStart() {}
-
-    /** Wait until an in-flight [prepareTrackAt] / load completes. */
+    /** Wait until an in-flight load completes. */
     suspend fun awaitPendingLoad() {}
 
     // Release resources

@@ -138,6 +138,12 @@ internal class SimpleMediaSessionCallback(
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.PREVIOUS, Bundle()))
                 .add(SessionCommand(MEDIA_CUSTOM_COMMAND.GET_PLATFORM_TOKEN, Bundle()))
                 .build()
+        // Kick off saved-queue restore early (non-blocking) so phone notification / AA
+        // already have playlist metadata by the time play arrives. onPlaybackResumption
+        // still awaits completion before returning items.
+        if (mediaPlayerHandler.player.mediaItemCount == 0) {
+            mediaPlayerHandler.mayBeRestoreQueue()
+        }
         // Do NOT auto-play on Gearhead bind. Android Auto / Media3 send Player.play()
         // when the car is ready — racing that caused connect-time focus fights.
 

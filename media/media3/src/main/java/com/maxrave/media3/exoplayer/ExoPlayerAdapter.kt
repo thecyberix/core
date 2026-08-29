@@ -249,13 +249,6 @@ class ExoPlayerAdapter(
         }
     }
 
-    override suspend fun prepareTrackAt(
-        index: Int,
-        positionMs: Long,
-    ) {
-        seekTo(index, positionMs)
-    }
-
     override suspend fun awaitPendingLoad() {}
 
     // Release resources

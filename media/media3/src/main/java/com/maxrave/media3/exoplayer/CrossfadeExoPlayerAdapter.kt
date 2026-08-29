@@ -54,6 +54,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.coroutineContext
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -69,11 +70,19 @@ private const val AA_LEAVE_PROJECTION_DEBOUNCE_MS = 2_000L
 /** When [resumeOnFocusGain] is set (call/nav), wait longer before a full AA disconnect cleanup. */
 private const val AA_LEAVE_PROJECTION_INTERRUPT_DEBOUNCE_MS = 30_000L
 
-/** Minimum buffered ahead before attaching to MediaSession / starting audible play. */
-private const val MIN_BUFFER_AHEAD_MS = 5_000L
+/**
+ * Minimum buffered ahead before starting audible play.
+ * Temporarily using Media3 defaults to A/B-test vs 5s/10s (prefetch kept).
+ */
+private const val MIN_BUFFER_AHEAD_MS =
+    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS.toLong()
 
-/** Mid-track restore must buffer further ahead than a start-of-track play. */
-private const val MID_TRACK_BUFFER_AHEAD_MS = 10_000L
+/** Mid-track resume ahead — Media3 after-rebuffer default. */
+private const val MID_TRACK_BUFFER_AHEAD_MS =
+    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS.toLong()
+
+/** Let the current track settle before precaching next items (CPU/network contention). */
+private const val PRECACHE_DEFER_MS = 8_000L
 
 /**
  * ExoPlayer implementation of [MediaPlayerInterface] with crossfade support.
@@ -237,21 +246,52 @@ internal class CrossfadeExoPlayerAdapter(
     @Volatile
     private var inAndroidAutoSession = false
 
+    /**
+     * Set immediately when AA projection drops. Blocks an in-flight AA load from calling
+     * [ExoPlayer.play] on the phone speaker after the user has left the car.
+     */
+    @Volatile
+    private var aaLeaveAbortPlay = false
+
     private val carConnectionObserver =
         Observer<Int> { connectionType ->
             Logger.w(
                 TAG,
                 "CarConnection type=$connectionType aaSession=$inAndroidAutoSession " +
-                    "resumePending=$resumeOnFocusGain",
+                    "resumePending=$resumeOnFocusGain abortPlay=$aaLeaveAbortPlay",
             )
             if (connectionType == CarConnection.CONNECTION_TYPE_PROJECTION) {
                 leaveProjectionJob?.cancel()
+                aaLeaveAbortPlay = false
                 inAndroidAutoSession = true
                 scheduleResumeAfterAaProjection()
             } else {
+                abortAaPlaybackBecauseLeftCar()
                 scheduleLeaveAndroidAuto()
             }
         }
+
+    /**
+     * Runs as soon as projection ends — do not wait for the debounce. An in-flight cold
+     * start can take several seconds (prefetch + buffer); without this, [loadTrackAt]
+     * finishes after the user walked away and audio starts on the phone.
+     */
+    private fun abortAaPlaybackBecauseLeftCar() {
+        aaLeaveAbortPlay = true
+        resumeOnFocusGain = false
+        internalPlayWhenReady = false
+        aaResumeJob?.cancel()
+        aaResumeJob = null
+        currentLoadJob?.cancel()
+        currentLoadJob = null
+        when (internalState) {
+            InternalState.PLAYING, InternalState.PREPARING -> {
+                Logger.w(TAG, "AA projection ended — aborting in-flight playback")
+                pauseInternal(intentional = true)
+            }
+            else -> Unit
+        }
+    }
 
     /**
      * Resume after a phone call / nav TTS / MODE switch if we were interrupted while playing on AA.
@@ -314,9 +354,15 @@ internal class CrossfadeExoPlayerAdapter(
                 Logger.w(TAG, "Left AA projection — stopping playback")
                 inAndroidAutoSession = false
                 resumeOnFocusGain = false
+                aaLeaveAbortPlay = true
                 internalPlayWhenReady = false
-                if (internalState == InternalState.PLAYING) {
-                    pauseInternal(intentional = true)
+                currentLoadJob?.cancel()
+                currentLoadJob = null
+                when (internalState) {
+                    InternalState.PLAYING, InternalState.PREPARING -> {
+                        pauseInternal(intentional = true)
+                    }
+                    else -> Unit
                 }
                 abandonAudioFocusInternal()
             }
@@ -344,7 +390,7 @@ internal class CrossfadeExoPlayerAdapter(
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_GAIN -> {
                     if (!isCrossfading) currentPlayer?.volume = internalVolume
-                    if (resumeOnFocusGain && inAndroidAutoSession) {
+                    if (resumeOnFocusGain && inAndroidAutoSession && !aaLeaveAbortPlay) {
                         Logger.w(TAG, "AUDIOFOCUS_GAIN → resume after interruption")
                         resumeOnFocusGain = false
                         play()
@@ -721,6 +767,7 @@ internal class CrossfadeExoPlayerAdapter(
     override fun play() {
         Logger.d(TAG, "play() called (state: $internalState, playWhenReady: $internalPlayWhenReady)")
         resumeOnFocusGain = false
+        aaLeaveAbortPlay = false
         intentionalPause = false
         castRemotePlayer?.let { remote ->
             internalPlayWhenReady = true
@@ -783,16 +830,6 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun pause() {
         pauseInternal(intentional = true)
-    }
-
-    /** Queue restore finished (playlist only). Next play() loads like a manual song tap. */
-    override fun onQueueRestoredAfterColdStart() {
-        Logger.w(
-            TAG,
-            "onQueueRestoredAfterColdStart: items=$mediaItemCount index=$currentMediaItemIndex " +
-                "pos=${cachedPosition}ms state=$internalState " +
-                "(IDLE — waiting for play() → loadAndPlay, same as manual)",
-        )
     }
 
     private fun pauseInternal(intentional: Boolean) {
@@ -1023,19 +1060,6 @@ internal class CrossfadeExoPlayerAdapter(
             createShuffleOrder()
         }
         notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
-    }
-
-    override suspend fun prepareTrackAt(
-        index: Int,
-        positionMs: Long,
-    ) {
-        currentLoadJob?.join()
-        val job =
-            coroutineScope.launch {
-                loadTrackAt(index, positionMs.coerceAtLeast(0L), shouldPlay = false)
-            }
-        currentLoadJob = job
-        job.join()
     }
 
     override suspend fun awaitPendingLoad() {
@@ -1649,6 +1673,10 @@ internal class CrossfadeExoPlayerAdapter(
         while (SystemClock.elapsedRealtime() < deadline &&
             player.playbackState != Player.STATE_ENDED
         ) {
+            if (aaLeaveAbortPlay) {
+                Logger.w(TAG, "Buffer wait aborted — AA session ended")
+                return
+            }
             val ahead =
                 maxOf(
                     player.bufferedPosition - player.currentPosition,
@@ -1669,8 +1697,7 @@ internal class CrossfadeExoPlayerAdapter(
 
     /**
      * Resolve and cache the stream URL/format before ExoPlayer prepare.
-     * Always call getStream — skipping when the DB format looked "fresh" brought
-     * cold-start AA jitter back (conditional prefetch experiment).
+     * Always call getStream — relying on ResolvingDataSource alone brought cold-start AA jitter back.
      */
     private suspend fun prefetchStreamForMediaItem(mediaItem: GenericMediaItem) {
         val videoId = mediaItem.mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO)
@@ -1696,8 +1723,6 @@ internal class CrossfadeExoPlayerAdapter(
      * Drop player-cache spans before prepare. Post-reboot spans can look complete but
      * decode as garbage; FLAG_IGNORE_CACHE_ON_ERROR does not catch that (decode fails
      * after a "successful" read). Evicting forces a clean fill behind a real URL.
-     *
-     * Always evict (not once-per-process): skipping repeats brought cold-start jitter back.
      */
     private fun evictPlayerCacheFor(mediaId: String) {
         runCatching {
@@ -1749,8 +1774,7 @@ internal class CrossfadeExoPlayerAdapter(
         } else {
             precachedPlayers.remove(videoId)?.player?.release()
             prefetchStreamForMediaItem(mediaItem)
-            // Required for post-reboot stability: corrupt spans decode as jitter/errors
-            // even with a real URL (IGNORE_CACHE_ON_ERROR does not cover decode failures).
+            // Post-reboot stability: corrupt spans decode as jitter even with a real URL.
             evictPlayerCacheFor(videoId)
             val pwf = createExoPlayerInstance()
             player = pwf.player
@@ -1808,7 +1832,13 @@ internal class CrossfadeExoPlayerAdapter(
         player.skipSilenceEnabled = internalSkipSilence
 
         if (shouldPlay) {
-            if (!requestAudioFocusInternal()) {
+            if (aaLeaveAbortPlay) {
+                Logger.w(TAG, "Auto-play suppressed — AA session ended before load finished")
+                player.pause()
+                player.playWhenReady = false
+                internalPlayWhenReady = false
+                transitionToState(InternalState.READY)
+            } else if (!requestAudioFocusInternal()) {
                 Logger.w(TAG, "Auto-play aborted: audio focus not granted")
                 player.pause()
                 transitionToState(InternalState.READY)
@@ -1835,7 +1865,8 @@ internal class CrossfadeExoPlayerAdapter(
         if (crossfadeEnabled && crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO) {
             loadAudioMetaIfNeeded(videoId)
         }
-        triggerPrecachingInternal()
+        // Defer next-track precache so it does not compete with first-play buffer fill.
+        schedulePrecachingInternal(PRECACHE_DEFER_MS)
     }
 
     // ========== Internal: Player Listener Management ==========
@@ -3078,6 +3109,22 @@ internal class CrossfadeExoPlayerAdapter(
     // ========== Internal: Precaching ==========
 
     /**
+     * Schedule next-track precache after [delayMs], cancelling any pending precache job.
+     * Used after a load so the current track can finish buffering without competing ExoPlayers.
+     */
+    private fun schedulePrecachingInternal(delayMs: Long) {
+        if (!precacheEnabled || playlist.isEmpty() || isCastActive) return
+        cancelPrecaching()
+        precacheJob =
+            coroutineScope.launch {
+                delay(delayMs)
+                if (!isActive) return@launch
+                Logger.d(TAG, "Deferred precache starting")
+                runPrecachingInternal()
+            }
+    }
+
+    /**
      * Trigger precaching - mirrors GstreamerPlayerAdapter.triggerPrecachingInternal()
      *
      * Creates ExoPlayer instances for upcoming tracks. Each player gets a MediaItem
@@ -3085,57 +3132,60 @@ internal class CrossfadeExoPlayerAdapter(
      */
     private fun triggerPrecachingInternal() {
         if (!precacheEnabled || playlist.isEmpty() || isCastActive) return
-
         cancelPrecaching()
         Logger.d(TAG, "Trigger precache")
         precacheJob =
             coroutineScope.launch {
-                try {
-                    val indicesToPrecache = mutableListOf<Int>()
+                runPrecachingInternal()
+            }
+    }
 
-                    val index = localCurrentMediaItemIndex
-                    for (i in 1..maxPrecacheCount) {
-                        val nextIndex =
-                            when (internalRepeatMode) {
-                                PlayerConstants.REPEAT_MODE_ALL -> {
-                                    (index + i) % playlist.size
-                                }
-                                else -> {
-                                    val next = index + i
-                                    if (next < playlist.size) next else break
-                                }
-                            }
+    private suspend fun runPrecachingInternal() {
+        try {
+            val indicesToPrecache = mutableListOf<Int>()
 
-                        if (nextIndex != localCurrentMediaItemIndex &&
-                            !precachedPlayers.containsKey(playlist.getOrNull(nextIndex)?.mediaId)
-                        ) {
-                            indicesToPrecache.add(nextIndex)
+            val index = localCurrentMediaItemIndex
+            for (i in 1..maxPrecacheCount) {
+                val nextIndex =
+                    when (internalRepeatMode) {
+                        PlayerConstants.REPEAT_MODE_ALL -> {
+                            (index + i) % playlist.size
+                        }
+                        else -> {
+                            val next = index + i
+                            if (next < playlist.size) next else break
                         }
                     }
 
-                    for (idx in indicesToPrecache) {
-                        if (!isActive) break
-
-                        val mediaItem = playlist.getOrNull(idx) ?: continue
-
-                        try {
-                            val pwf = createExoPlayerInstance()
-                            pwf.player.setMediaItem(mediaItem.toMedia3MediaItem())
-                            pwf.player.prepare()
-                            precachedPlayers[mediaItem.mediaId] = PrecachedPlayer(pwf.player, mediaItem, pwf.filter)
-                            Logger.d(TAG, "Precached player for index $idx")
-                        } catch (e: Exception) {
-                            Logger.e(TAG, "Precaching error for $idx: ${e.message}")
-                        }
-
-                        delay(100)
-                    }
-                } catch (e: Exception) {
-                    if (e !is CancellationException) {
-                        Logger.e(TAG, "Precaching error: ${e.message}")
-                    }
+                if (nextIndex != localCurrentMediaItemIndex &&
+                    !precachedPlayers.containsKey(playlist.getOrNull(nextIndex)?.mediaId)
+                ) {
+                    indicesToPrecache.add(nextIndex)
                 }
             }
+
+            for (idx in indicesToPrecache) {
+                if (!coroutineContext.isActive) break
+
+                val mediaItem = playlist.getOrNull(idx) ?: continue
+
+                try {
+                    val pwf = createExoPlayerInstance()
+                    pwf.player.setMediaItem(mediaItem.toMedia3MediaItem())
+                    pwf.player.prepare()
+                    precachedPlayers[mediaItem.mediaId] = PrecachedPlayer(pwf.player, mediaItem, pwf.filter)
+                    Logger.d(TAG, "Precached player for index $idx")
+                } catch (e: Exception) {
+                    Logger.e(TAG, "Precaching error for $idx: ${e.message}")
+                }
+
+                delay(100)
+            }
+        } catch (e: Exception) {
+            if (e !is CancellationException) {
+                Logger.e(TAG, "Precaching error: ${e.message}")
+            }
+        }
     }
 
     private fun cancelPrecaching() {

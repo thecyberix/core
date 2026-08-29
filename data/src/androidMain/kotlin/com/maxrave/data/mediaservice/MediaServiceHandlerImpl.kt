@@ -321,7 +321,9 @@ internal class MediaServiceHandlerImpl(
                         },
                 )
         }
-        mayBeRestoreQueue()
+        // Do not restore the saved queue here — that races AA MediaSession play and
+        // duplicates work. Restore lazily from MediaSession onConnect / onPlaybackResumption
+        // when the playlist is still empty.
         coroutineScope.launch {
             val controlStateJob =
                 launch {
@@ -2274,18 +2276,14 @@ internal class MediaServiceHandlerImpl(
                                 ),
                             )
                             val mediaItems = listTracks.map { it.toGenericMediaItem() }
-                            // Playlist + resume position only — do NOT prepareTrackAt.
-                            // AA/MediaSession play() then hits the IDLE → loadAndPlay path,
-                            // the same continuous prepare→buffer→play as a manual song tap.
-                            // Pre-preparing paused then later AudioTrack.start() caused cold-start
-                            // underrun jitter even with prefetch/evict/buffer waits.
+                            // Playlist + resume position only. MediaSession play() then hits
+                            // IDLE → loadAndPlay — the same path as a manual song tap.
                             player.setPlaylistItems(mediaItems, index, savedPosition)
                             _queueData.update {
                                 it.copy(queueState = QueueData.StateSource.STATE_INITIALIZED)
                             }
                             reorderShuffledQueue(player.getCurrentMediaTimeLine())
                             updateNextPreviousTrackAvailability()
-                            player.onQueueRestoredAfterColdStart()
                         }
                     }
                 } finally {
